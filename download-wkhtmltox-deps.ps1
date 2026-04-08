@@ -174,7 +174,14 @@ function Resolve-DependencySources {
     foreach ($mirror in $Mirrors) {
         foreach ($repo in $Spec.repos) {
             $repoPkgs = Get-MirrorRepoPackages -MirrorBase $mirror -RepoName $repo
-            $best = $repoPkgs |
+            # First pass: filter out -devel, -utils, -debuginfo packages to get runtime only
+            $runtimePkgs = $repoPkgs |
+                Where-Object { $_.Name -notmatch '-(devel|debuginfo|debugsource|utils|doc|static|libs)$' }
+            # If no runtime packages found, try all compatible candidates
+            if ($runtimePkgs.Count -eq 0) {
+                $runtimePkgs = $repoPkgs
+            }
+            $best = $runtimePkgs |
                 Where-Object { Test-RpmCompatibility -PackageName $_.Name -PackageArch $_.Arch -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
                 Sort-Object BuildTime, FileName -Descending |
                 Select-Object -First 1
