@@ -1,326 +1,333 @@
-#!/usr/bin/env pwsh
-# Downloads wkhtmltox and its missing shared-library dependencies
-# for AlmaLinux/RHEL 8 x86_64 with mirror fallback.
-#
-# Usage (run once on a machine WITH internet access):
-#   powershell -ExecutionPolicy Bypass -File .\resources\tools\download-wkhtmltox-deps.ps1
-#
-# Optional custom mirrors (e.g. internal Nexus/Artifactory):
-#   powershell -ExecutionPolicy Bypass -File .\resources\tools\download-wkhtmltox-deps.ps1 -MirrorBaseUrls @("https://nexus.local/almalinux/8")
+<#
+.SYNOPSIS
+  Pobiera RPM-y potrzebne do uruchomienia Chromium (headless) na RHEL/UBI 8.
 
+.DESCRIPTION
+  Skrypt działa na Windows (PowerShell) i pobiera paczki RPM do katalogu docelowego,
+  wykorzystując repozytoria UBI 8 (BaseOS + AppStream).
+
+  Typowy use-case: sieć/CI nie ma dostępu do CDN RedHat z powodu błędu certyfikatu,
+  więc pobierasz RPM-y w środowisku, które ma poprawny dostęp (np. poza MITM albo z
+  właściwym CA), a potem commitujesz/archiwizujesz je i używasz offline podczas builda.
+
+  Skrypt:
+  - pobiera repodata (w tym primary.xml.gz)
+  - parsuje listę pakietów i zależności (requires)
+  - pobiera wszystkie potrzebne RPM-y (z obu repo)
+
+  UWAGA:
+  - Repo UBI jest publiczne, ale nadal może wymagać poprawnej walidacji TLS.
+  - Skrypt nie wyłącza walidacji certyfikatów globalnie.
+
+.PARAMETER Destination
+  Katalog, do którego zostaną zapisane RPM-y.
+
+.PARAMETER UbiRelease
+  Wersja UBI8 (domyślnie 8).
+
+.PARAMETER Arch
+  Architektura (domyślnie x86_64).
+
+.PARAMETER Packages
+  Lista paczek do ściągnięcia (domyślnie: chromium + typowe zależności headless).
+
+.PARAMETER WhatRequires
+  Jeśli podasz nazwę capability (np. 'chromium'), skrypt spróbuje znaleźć pakiet dostarczający
+  tę capability. Zwykle niepotrzebne.
+
+.EXAMPLE
+  # Pobranie RPM do resources/tools/chromium-rpms
+  .\resources\tools\download-chromium-deps.ps1 -Destination .\resources\tools\chromium-rpms
+
+.EXAMPLE
+  # Pobranie tylko chromium i liberation-fonts
+  .\resources\tools\download-chromium-deps.ps1 -Destination .\rpms -Packages chromium,liberation-fonts
+#>
+
+[CmdletBinding()]
 param(
-    [string[]]$MirrorBaseUrls = @(
-        "https://repo.almalinux.org/almalinux/8",
-        "https://dl.rockylinux.org/pub/rocky/8"
-    ),
-    [string]$LocalPackageDir,
-    [switch]$ListOnly
+  [Parameter(Mandatory = $true)]
+  [string]$Destination,
+
+  [ValidateSet('8')]
+  [string]$UbiRelease = '8',
+
+  [ValidateSet('x86_64')]
+  [string]$Arch = 'x86_64',
+
+  [string[]]$Packages = @(
+    'chromium',
+    'atk',
+    'at-spi2-atk',
+    'cups-libs',
+    'fontconfig',
+    'freetype',
+    'gtk3',
+    'libX11',
+    'libXcomposite',
+    'libXcursor',
+    'libXdamage',
+    'libXext',
+    'libXi',
+    'libXrandr',
+    'libXrender',
+    'libXtst',
+    'libdrm',
+    'mesa-libgbm',
+    'nss',
+    'pango',
+    'xdg-utils',
+    'liberation-fonts',
+    'dejavu-sans-fonts'
+  ),
+
+  [string]$WhatRequires,
+
+  # Opcjonalnie: alternatywny mirror / artifactory. Musi wskazywać na katalog nadrzędny
+  # zawierający /baseos/os oraz /appstream/os.
+  [string]$RepoBaseUrl,
+
+  # Opcjonalnie: proxy dla Invoke-WebRequest, np. http://proxy:8080
+  [string]$Proxy
 )
 
-$outputDir = $PSScriptRoot   # resources/tools/
-$targetTag = "el8"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-$wkhtmltoxUrls = @(
-    "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox-0.12.6.1-2.almalinux8.x86_64.rpm"
-)
+$ProgressPreference = 'SilentlyContinue'
 
-$repoMetadataCache = @{}
-$defaultRepos = @("BaseOS", "AppStream")
-
-$dependencySpecs = @(
-    # Direct missing .so dependencies (from ldd output)
-    @{ repos = $defaultRepos; names = @("libjpeg-turbo"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libpng", "libpng15"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libXrender"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("fontconfig"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("freetype"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libXext"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libX11"); arches = @("x86_64") },
-
-    # Transitive deps (libX11 -> libxcb -> libXau)
-    @{ repos = $defaultRepos; names = @("libxcb"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libXau"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libXdmcp"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("libX11-common"); arches = @("noarch") },
-
-    # Runtime font packages required by wkhtmltox RPM dependencies
-    @{ repos = $defaultRepos; names = @("xorg-x11-fonts-75dpi"); arches = @("noarch") },
-    @{ repos = $defaultRepos; names = @("xorg-x11-fonts-Type1"); arches = @("noarch") },
-    @{ repos = $defaultRepos; names = @("xorg-x11-font-utils", "xorg-x11-utils"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("fontpackages-filesystem"); arches = @("noarch") },
-
-    # Missing deps frequently seen in offline installs
-    @{ repos = $defaultRepos; names = @("libfontenc"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("ttmkfdir"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("pkgconf-pkg-config"); arches = @("x86_64") },
-    @{ repos = $defaultRepos; names = @("dejavu-fonts-common"); arches = @("noarch") },
-    @{ repos = $defaultRepos; names = @("dejavu-sans-fonts"); arches = @("noarch") }
-)
-
-function Test-RpmCompatibility {
-    param(
-        [string]$PackageName,
-        [string]$PackageArch,
-        [string]$FileName,
-        [string[]]$Names,
-        [string[]]$Arches
-    )
-
-    if (-not ($Names -contains $PackageName)) { return $false }
-
-    if (-not ($Arches -contains $PackageArch)) { return $false }
-
-    # Keep only runtime libraries/tools required by wkhtmltox.
-    if ($PackageName -match "-(devel|debuginfo|debugsource|utils)$") { return $false }
-
-    if ($FileName -match '\.almalinux8\.') { return $true }
-    if ($FileName -match '\.el8([._-]|\.)') { return $true }
-
-    return $false
+function Write-Info([string]$Message) {
+  Write-Host "[INFO] $Message"
 }
 
-function Get-MirrorRepoPackages {
-    param(
-        [string]$MirrorBase,
-        [string]$RepoName
-    )
+function Write-Warn([string]$Message) {
+  Write-Host "[WARN] $Message" -ForegroundColor Yellow
+}
 
-    $cacheKey = "$MirrorBase|$RepoName"
-    if ($repoMetadataCache.ContainsKey($cacheKey)) {
-        return $repoMetadataCache[$cacheKey]
-    }
+function Write-Err([string]$Message) {
+  Write-Host "[ERROR] $Message" -ForegroundColor Red
+}
 
-    $repoRoot = "{0}/{1}/x86_64/os" -f $MirrorBase.TrimEnd('/'), $RepoName
-    $repomdUrl = "$repoRoot/repodata/repomd.xml"
+function Ensure-Dir([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) {
+    New-Item -ItemType Directory -Path $Path | Out-Null
+  }
+}
 
+function Invoke-Download([string]$Url, [string]$OutFile) {
+  if (Test-Path -LiteralPath $OutFile) {
+    return
+  }
+  Write-Info "GET $Url"
+  $iwr = @{ Uri = $Url; OutFile = $OutFile; UseBasicParsing = $true }
+  if ($Proxy) { $iwr.Proxy = $Proxy }
+  Invoke-WebRequest @iwr
+}
+
+# UBI 8 public repos (lub mirror)
+$BaseUrl = if ($RepoBaseUrl) { $RepoBaseUrl.TrimEnd('/') } else { "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi$UbiRelease/$UbiRelease/$Arch" }
+$Repos = @(
+  @{ Name = 'baseos';    RepoId='ubi-8-baseos-rpms';    Url = "$BaseUrl/baseos/os" },
+  @{ Name = 'appstream'; RepoId='ubi-8-appstream-rpms'; Url = "$BaseUrl/appstream/os" }
+)
+
+Ensure-Dir $Destination
+$Cache = Join-Path $Destination ".cache"
+Ensure-Dir $Cache
+
+# --- Helpers to parse repodata ---
+
+function Get-RepoMetadata([hashtable]$Repo) {
+  $repodataDir = Join-Path $Cache ("repodata-" + $Repo.Name)
+  Ensure-Dir $repodataDir
+
+  $repomdUrl = "$($Repo.Url)/repodata/repomd.xml"
+  $repomdFile = Join-Path $repodataDir "repomd.xml"
+  Invoke-Download $repomdUrl $repomdFile
+
+  [xml]$repomd = Get-Content -LiteralPath $repomdFile
+  $ns = New-Object System.Xml.XmlNamespaceManager($repomd.NameTable)
+  $ns.AddNamespace('repo', 'http://linux.duke.edu/metadata/repo')
+
+  $primaryNode = $repomd.SelectSingleNode("//repo:data[@type='primary']/repo:location", $ns)
+  if (-not $primaryNode) { throw "Brak primary w repomd.xml dla repo $($Repo.Name)" }
+  $primaryHref = $primaryNode.GetAttribute('href')
+
+  $primaryUrl = "$($Repo.Url)/$primaryHref"
+  $primaryGz = Join-Path $repodataDir (Split-Path $primaryHref -Leaf)
+  Invoke-Download $primaryUrl $primaryGz
+
+  $primaryXml = Join-Path $repodataDir "primary.xml"
+  if (-not (Test-Path -LiteralPath $primaryXml)) {
+    Write-Info "Decompress $primaryGz"
+    $gzStream = [System.IO.File]::OpenRead($primaryGz)
     try {
-        $repomdText = (Invoke-WebRequest -Uri $repomdUrl -UseBasicParsing -TimeoutSec 60).Content
-        [xml]$repomd = $repomdText
-
-        $ns = New-Object System.Xml.XmlNamespaceManager($repomd.NameTable)
-        $ns.AddNamespace("r", "http://linux.duke.edu/metadata/repo")
-        $primaryNode = $repomd.SelectSingleNode("//r:data[@type='primary']/r:location", $ns)
-        if ($null -eq $primaryNode) {
-            throw "primary metadata entry not found"
-        }
-
-        $primaryHref = $primaryNode.GetAttribute("href")
-        $primaryUrl = "$repoRoot/$primaryHref"
-        $primaryGz = Join-Path $env:TEMP (([Guid]::NewGuid().ToString()) + ".xml.gz")
-
-        Invoke-WebRequest -Uri $primaryUrl -OutFile $primaryGz -UseBasicParsing -TimeoutSec 120
-
+      $outStream = [System.IO.File]::Create($primaryXml)
+      try {
+        $gzip = New-Object System.IO.Compression.GzipStream($gzStream, [System.IO.Compression.CompressionMode]::Decompress)
         try {
-            $fileStream = [System.IO.File]::OpenRead($primaryGz)
-            $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
-            $reader = New-Object System.IO.StreamReader($gzipStream)
-            $primaryXmlText = $reader.ReadToEnd()
-        }
-        finally {
-            if ($reader) { $reader.Dispose() }
-            if ($gzipStream) { $gzipStream.Dispose() }
-            if ($fileStream) { $fileStream.Dispose() }
-            Remove-Item -Path $primaryGz -ErrorAction SilentlyContinue
-        }
+          $gzip.CopyTo($outStream)
+        } finally { $gzip.Dispose() }
+      } finally { $outStream.Dispose() }
+    } finally { $gzStream.Dispose() }
+  }
 
-        [xml]$primary = $primaryXmlText
-        $pns = New-Object System.Xml.XmlNamespaceManager($primary.NameTable)
-        $pns.AddNamespace("c", "http://linux.duke.edu/metadata/common")
+  [xml]$primary = Get-Content -LiteralPath $primaryXml
+  $ns2 = New-Object System.Xml.XmlNamespaceManager($primary.NameTable)
+  $ns2.AddNamespace('common', 'http://linux.duke.edu/metadata/common')
+  $ns2.AddNamespace('rpm', 'http://linux.duke.edu/metadata/rpm')
 
-        $result = @()
-        foreach ($pkgNode in $primary.SelectNodes("//c:package[@type='rpm']", $pns)) {
-            $nameNode = $pkgNode.SelectSingleNode("c:name", $pns)
-            $archNode = $pkgNode.SelectSingleNode("c:arch", $pns)
-            $locNode = $pkgNode.SelectSingleNode("c:location", $pns)
-            $timeNode = $pkgNode.SelectSingleNode("c:time", $pns)
-            if ($null -eq $nameNode -or $null -eq $archNode -or $null -eq $locNode) { continue }
-
-            $href = $locNode.GetAttribute("href")
-            if ([string]::IsNullOrWhiteSpace($href)) { continue }
-
-            $buildTime = 0
-            if ($timeNode -ne $null) {
-                [void][int64]::TryParse($timeNode.GetAttribute("build"), [ref]$buildTime)
-            }
-
-            $result += [pscustomobject]@{
-                Name      = $nameNode.InnerText
-                Arch      = $archNode.InnerText
-                FileName  = [System.IO.Path]::GetFileName($href)
-                Url       = "$repoRoot/$href"
-                BuildTime = $buildTime
-            }
-        }
-
-        $repoMetadataCache[$cacheKey] = $result
-        return $result
-    }
-    catch {
-        Write-Warning "Unable to read metadata from $repomdUrl : $($_.Exception.Message)"
-        $repoMetadataCache[$cacheKey] = @()
-        return @()
-    }
+  return @{
+    Repo = $Repo
+    Primary = $primary
+    Ns = $ns2
+  }
 }
 
-function Resolve-DependencySources {
-    param(
-        [hashtable]$Spec,
-        [string[]]$Mirrors,
-        [string]$LocalDir
-    )
-
-    $candidateUrls = @()
-
-    foreach ($mirror in $Mirrors) {
-        foreach ($repo in $Spec.repos) {
-            $repoPkgs = Get-MirrorRepoPackages -MirrorBase $mirror -RepoName $repo
-            # First pass: filter out -devel, -utils, -debuginfo packages to get runtime only
-            $runtimePkgs = $repoPkgs |
-                Where-Object { $_.Name -notmatch '-(devel|debuginfo|debugsource|utils|doc|static|libs)$' }
-            # If no runtime packages found, try all compatible candidates
-            if ($runtimePkgs.Count -eq 0) {
-                $runtimePkgs = $repoPkgs
-            }
-            $best = $runtimePkgs |
-                Where-Object { Test-RpmCompatibility -PackageName $_.Name -PackageArch $_.Arch -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
-                Sort-Object BuildTime, FileName -Descending |
-                Select-Object -First 1
-
-            if ($best) {
-                $candidateUrls += $best.Url
-            }
-        }
-    }
-
-    $fileName = $null
-    if ($candidateUrls.Count -gt 0) {
-        $fileName = [System.IO.Path]::GetFileName($candidateUrls[0])
-    }
-
-    if (-not $fileName -and $LocalDir) {
-        $localBest = Get-ChildItem -Path $LocalDir -Filter "*.rpm" -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $pkgArch = if ($_.Name -match '\.([^.]+)\.rpm$') { $Matches[1] } else { "" }
-                $pkgName = ""
-                foreach ($candidateName in $Spec.names) {
-                    if ($_.Name -match "^$([regex]::Escape($candidateName))-") {
-                        $pkgName = $candidateName
-                        break
-                    }
-                }
-                Test-RpmCompatibility -PackageName $pkgName -PackageArch $pkgArch -FileName $_.Name -Names $Spec.names -Arches $Spec.arches
-            } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-
-        if ($localBest) {
-            $fileName = $localBest.Name
-        }
-    }
-
-    if (-not $fileName) {
-        return $null
-    }
-
-    return [pscustomobject]@{
-        FileName = $fileName
-        Urls     = $candidateUrls
-    }
+function Get-PackageNodesByName($Meta, [string]$Name) {
+  $Meta.Primary.SelectNodes("//common:package[common:name='$Name']", $Meta.Ns)
 }
 
-$packages = @()
-$packages += @{ name = "wkhtmltox"; urls = $wkhtmltoxUrls }
-
-foreach ($spec in $dependencySpecs) {
-    $resolved = Resolve-DependencySources -Spec $spec -Mirrors $MirrorBaseUrls -LocalDir $LocalPackageDir
-    if ($null -eq $resolved) {
-        $failedName = "{0}:{1}" -f ([string]::Join('+', $spec.repos)), ([string]::Join('|', $spec.names))
-        Write-Warning "Unable to resolve package for $failedName (compatible with $targetTag)"
-        $packages += @{ name = $failedName; urls = @(); unresolved = $true }
-        continue
-    }
-
-    $packages += @{ name = $resolved.FileName; urls = $resolved.Urls; unresolved = $false }
+function Get-ProvidesCapabilities($PkgNode, $Ns) {
+  $caps = @()
+  $provideNodes = $PkgNode.SelectNodes('common:format/rpm:provides/rpm:entry', $Ns)
+  foreach ($n in $provideNodes) {
+    $caps += $n.GetAttribute('name')
+  }
+  return $caps
 }
 
-Write-Host "Downloading RPMs to: $outputDir"
-Write-Host "Configured mirrors:"
-$MirrorBaseUrls | ForEach-Object { Write-Host "  - $_" }
-if ($LocalPackageDir) {
-    Write-Host "Local package directory: $LocalPackageDir"
+function Get-RequireCapabilities($PkgNode, $Ns) {
+  $caps = @()
+  $reqNodes = $PkgNode.SelectNodes('common:format/rpm:requires/rpm:entry', $Ns)
+  foreach ($n in $reqNodes) {
+    $name = $n.GetAttribute('name')
+    if ($name -and ($name -notlike 'rpmlib(*)') -and ($name -notlike 'config(*)') -and ($name -notlike 'post(*)') -and ($name -notlike 'pre(*)')) {
+      $caps += $name
+    }
+  }
+  return $caps
 }
 
-$failed = @()
-foreach ($pkg in $packages) {
-    if ($pkg.unresolved) {
-        $failed += $pkg.name
-        Write-Warning "  [MISS] $($pkg.name)"
-        continue
-    }
-
-    $fileName = $pkg.name
-    if ($pkg.urls.Count -gt 0) {
-        $fileName = $pkg.urls[0].Split('/')[-1]
-    }
-    $destPath = Join-Path $outputDir $fileName
-
-    if (Test-Path $destPath) {
-        Write-Host "  [SKIP] $fileName (already exists)"
-        continue
-    }
-
-    Write-Host "  [GET]  $fileName"
-    if ($ListOnly) {
-        if ($LocalPackageDir) {
-            Write-Host "         -> local candidate: $(Join-Path $LocalPackageDir $fileName)"
-        }
-        if ($pkg.urls.Count -eq 0) {
-            Write-Host "         -> candidate: <none found in configured mirrors>"
-        } else {
-            $pkg.urls | ForEach-Object { Write-Host "         -> candidate: $_" }
-        }
-        continue
-    }
-
-    if ($LocalPackageDir) {
-        $localPath = Join-Path $LocalPackageDir $fileName
-        if (Test-Path $localPath) {
-            Copy-Item -Path $localPath -Destination $des tPath -Force
-            Write-Host "         -> OK from local dir: $localPath"
-            continue
-        }
-    }
-
-    if ($pkg.urls.Count -eq 0) {
-        $failed += $fileName
-        Write-Warning "         -> No mirror candidates resolved for $fileName"
-        continue
-    }
-
-    $ok = $false
-    foreach ($url in $pkg.urls) {
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $destPath -UseBasicParsing -TimeoutSec 60
-            Write-Host "         -> OK from $url"
-            $ok = $true
-            break
-        } catch {
-            Write-Warning "         -> FAILED from $url : $($_.Exception.Message)"
-        }
-    }
-
-    if (-not $ok) {
-        $failed += $fileName
-        Write-Warning "         -> Unable to download $fileName from all configured sources"
-    }
+function Get-PackageDownloadInfo($PkgNode, $RepoUrl, $Ns) {
+  $loc = $PkgNode.SelectSingleNode('common:location', $Ns)
+  if (-not $loc) { return $null }
+  $href = $loc.GetAttribute('href')
+  $fileName = Split-Path $href -Leaf
+  return @{
+    FileName = $fileName
+    Href = $href
+    Url = "$RepoUrl/$href"
+  }
 }
 
-Write-Host ""
-Write-Host "Done. RPMs in $outputDir :"
-Get-ChildItem $outputDir -Filter "*.rpm" | Select-Object Name, @{N="Size(KB)";E={[math]::Round($_.Length/1KB,1)}}
-
-if ($failed.Count -gt 0) {
-    Write-Error "Missing packages: $($failed -join ', '). Add another mirror via -MirrorBaseUrls or download RPMs manually."
-    exit 1
+# Build metadata for both repos
+$Metas = @()
+foreach ($r in $Repos) {
+  try {
+    Write-Info "Loading repodata: $($r.Name)"
+    $Metas += (Get-RepoMetadata $r)
+  } catch {
+    Write-Err "Nie udalo sie pobrac repodata dla $($r.Name): $($_.Exception.Message)"
+    throw
+  }
 }
+
+# Index: capability -> package node (first win)
+$ProvideIndex = @{}
+$NameIndex = @{}
+foreach ($m in $Metas) {
+  $pkgs = $m.Primary.SelectNodes('//common:package', $m.Ns)
+  foreach ($p in $pkgs) {
+    $name = $p.SelectSingleNode('common:name', $m.Ns).InnerText
+    if (-not $NameIndex.ContainsKey($name)) {
+      $NameIndex[$name] = @()
+    }
+    $NameIndex[$name] += @(@{ Meta=$m; Node=$p })
+
+    foreach ($cap in (Get-ProvidesCapabilities $p $m.Ns)) {
+      if (-not $ProvideIndex.ContainsKey($cap)) {
+        $ProvideIndex[$cap] = @{ Meta=$m; Node=$p }
+      }
+    }
+  }
+}
+
+function Resolve-Package([string]$NameOrCap) {
+  if ($NameIndex.ContainsKey($NameOrCap)) {
+    # prefer appstream for chromium itself
+    $candidates = $NameIndex[$NameOrCap]
+    $sorted = $candidates | Sort-Object { $_.Meta.Repo.Name -ne 'appstream' }
+    return $sorted[0]
+  }
+  if ($ProvideIndex.ContainsKey($NameOrCap)) {
+    return $ProvideIndex[$NameOrCap]
+  }
+  return $null
+}
+
+# Optionally find provider for a given capability
+if ($WhatRequires) {
+  $prov = Resolve-Package $WhatRequires
+  if (-not $prov) {
+    Write-Err "Nie znaleziono providera dla capability: $WhatRequires"
+    exit 2
+  }
+  $n = $prov.Node.SelectSingleNode('common:name', $prov.Meta.Ns).InnerText
+  Write-Info "Provider for '$WhatRequires' => package: $n (repo: $($prov.Meta.Repo.Name))"
+}
+
+# BFS dependency resolution
+$Queue = New-Object System.Collections.Generic.Queue[string]
+$Visited = New-Object 'System.Collections.Generic.HashSet[string]'
+$Selected = @{} # pkgName -> {Meta,Node}
+
+foreach ($p in $Packages) { $Queue.Enqueue($p) }
+
+while ($Queue.Count -gt 0) {
+  $item = $Queue.Dequeue()
+  if ($Visited.Contains($item)) { continue }
+  $null = $Visited.Add($item)
+
+  $resolved = Resolve-Package $item
+  if (-not $resolved) {
+    Write-Warn "Nie znaleziono pakietu/capability: $item (pomijam)"
+    continue
+  }
+
+  $pkgName = $resolved.Node.SelectSingleNode('common:name', $resolved.Meta.Ns).InnerText
+  if (-not $Selected.ContainsKey($pkgName)) {
+    $Selected[$pkgName] = $resolved
+
+    $requires = Get-RequireCapabilities $resolved.Node $resolved.Meta.Ns
+    foreach ($req in $requires) {
+      if (-not $Visited.Contains($req)) {
+        $Queue.Enqueue($req)
+      }
+    }
+  }
+}
+
+Write-Info "Do pobrania pakietow: $($Selected.Keys.Count)"
+
+# Download RPM files
+foreach ($kv in $Selected.GetEnumerator()) {
+  $pkg = $kv.Value
+  $info = Get-PackageDownloadInfo $pkg.Node $pkg.Meta.Repo.Url $pkg.Meta.Ns
+  if (-not $info) {
+    Write-Warn "Brak location dla pakietu: $($kv.Key)"
+    continue
+  }
+
+  $out = Join-Path $Destination $info.FileName
+  try {
+    Invoke-Download $info.Url $out
+  } catch {
+    Write-Err "Nie udalo sie pobrac $($info.Url): $($_.Exception.Message)"
+    throw
+  }
+}
+
+Write-Info "Gotowe. RPM-y sa w: $Destination"
+Write-Info "Wskazowka: skopiuj te RPM do resources/tools/ lub osobnego katalogu i dostosuj Dockerfile do instalacji offline."
 
