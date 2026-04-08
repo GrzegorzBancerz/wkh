@@ -236,6 +236,21 @@ foreach ($r in $Repos) {
 # Index: capability -> package node (first win)
 $ProvideIndex = @{}
 $NameIndex = @{}
+
+function Get-PackageArch($PkgNode, $Ns) {
+  $archNode = $PkgNode.SelectSingleNode('common:arch', $Ns)
+  if ($archNode) { return $archNode.InnerText }
+  return ''
+}
+
+function Get-ArchPriority([string]$Arch) {
+  switch ($Arch) {
+    'x86_64' { return 0 }
+    'noarch' { return 1 }
+    'i686'   { return 9 }
+    default  { return 5 }
+  }
+}
 foreach ($m in $Metas) {
   $pkgs = $m.Primary.SelectNodes('//common:package', $m.Ns)
   foreach ($p in $pkgs) {
@@ -246,22 +261,33 @@ foreach ($m in $Metas) {
     $NameIndex[$name] += @(@{ Meta=$m; Node=$p })
 
     foreach ($cap in (Get-ProvidesCapabilities $p $m.Ns)) {
-      if (-not $ProvideIndex.ContainsKey($cap)) {
-        $ProvideIndex[$cap] = @{ Meta=$m; Node=$p }
-      }
+      if (-not $ProvideIndex.ContainsKey($cap)) { $ProvideIndex[$cap] = @() }
+      $ProvideIndex[$cap] += @(@{ Meta=$m; Node=$p })
     }
   }
 }
 
 function Resolve-Package([string]$NameOrCap) {
   if ($NameIndex.ContainsKey($NameOrCap)) {
-    # prefer appstream for chromium itself
     $candidates = $NameIndex[$NameOrCap]
-    $sorted = $candidates | Sort-Object { $_.Meta.Repo.Name -ne 'appstream' }
-    return $sorted[0]
+    # prefer: repo appstream, then arch x86_64/noarch, then anything else
+    $sorted = $candidates | Sort-Object \
+      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, \
+      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+    $best = $sorted[0]
+    $arch = Get-PackageArch $best.Node $best.Meta.Ns
+    if ($arch -eq 'i686') { return $null }
+    return $best
   }
   if ($ProvideIndex.ContainsKey($NameOrCap)) {
-    return $ProvideIndex[$NameOrCap]
+    $candidates = $ProvideIndex[$NameOrCap]
+    $sorted = $candidates | Sort-Object \
+      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, \
+      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+    $best = $sorted[0]
+    $arch = Get-PackageArch $best.Node $best.Meta.Ns
+    if ($arch -eq 'i686') { return $null }
+    return $best
   }
   return $null
 }
