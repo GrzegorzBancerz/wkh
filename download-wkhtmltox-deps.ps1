@@ -11,7 +11,6 @@
 param(
     [string[]]$MirrorBaseUrls = @(
         "https://repo.almalinux.org/almalinux/8",
-        "https://mirror.stream.centos.org/8-stream",
         "https://dl.rockylinux.org/pub/rocky/8"
     ),
     [string]$LocalPackageDir,
@@ -47,7 +46,7 @@ $dependencySpecs = @(
     @{ repo = "AppStream"; names = @("xorg-x11-fonts-75dpi"); arches = @("noarch") },
     @{ repo = "AppStream"; names = @("xorg-x11-fonts-Type1"); arches = @("noarch") },
     @{ repo = "AppStream"; names = @("xorg-x11-font-utils", "xorg-x11-utils"); arches = @("x86_64") },
-    @{ repo = "AppStream"; names = @("fontpackages-filesystem"); arches = @("noarch") },
+    @{ repo = "BaseOS"; names = @("fontpackages-filesystem"); arches = @("noarch") },
 
     # Missing deps frequently seen in offline installs
     @{ repo = "AppStream"; names = @("libfontenc"); arches = @("x86_64") },
@@ -59,30 +58,21 @@ $dependencySpecs = @(
 
 function Test-RpmCompatibility {
     param(
+        [string]$PackageName,
+        [string]$PackageArch,
         [string]$FileName,
         [string[]]$Names,
         [string[]]$Arches
     )
 
-    $matchesName = $false
-    foreach ($name in $Names) {
-        if ($FileName.StartsWith("$name-")) {
-            $matchesName = $true
-            break
-        }
-    }
-    if (-not $matchesName) { return $false }
+    if (-not ($Names -contains $PackageName)) { return $false }
 
-    $matchesArch = $false
-    foreach ($arch in $Arches) {
-        if ($FileName -like "*.$arch.rpm") {
-            $matchesArch = $true
-            break
-        }
-    }
-    if (-not $matchesArch) { return $false }
+    if (-not ($Arches -contains $PackageArch)) { return $false }
 
-    return ($FileName -like "*.$targetTag.*.rpm" -or $FileName -like "*.noarch.rpm" -or $FileName -like "*almalinux8*.rpm")
+    if ($FileName -match "\\.almalinux8\\.") { return $true }
+    if ($FileName -match "\\.el8([._-]|\\.)") { return $true }
+
+    return $false
 }
 
 function Get-MirrorRepoPackages {
@@ -180,7 +170,7 @@ function Resolve-DependencySources {
     foreach ($mirror in $Mirrors) {
         $repoPkgs = Get-MirrorRepoPackages -MirrorBase $mirror -RepoName $Spec.repo
         $best = $repoPkgs |
-            Where-Object { Test-RpmCompatibility -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
+            Where-Object { Test-RpmCompatibility -PackageName $_.Name -PackageArch $_.Arch -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
             Sort-Object BuildTime, FileName -Descending |
             Select-Object -First 1
 
@@ -196,7 +186,17 @@ function Resolve-DependencySources {
 
     if (-not $fileName -and $LocalDir) {
         $localBest = Get-ChildItem -Path $LocalDir -Filter "*.rpm" -File -ErrorAction SilentlyContinue |
-            Where-Object { Test-RpmCompatibility -FileName $_.Name -Names $Spec.names -Arches $Spec.arches } |
+            Where-Object {
+                $pkgArch = if ($_.Name -match "\\.([^.]+)\\.rpm$") { $Matches[1] } else { "" }
+                $pkgName = ""
+                foreach ($candidateName in $Spec.names) {
+                    if ($_.Name -match "^$([regex]::Escape($candidateName))-") {
+                        $pkgName = $candidateName
+                        break
+                    }
+                }
+                Test-RpmCompatibility -PackageName $pkgName -PackageArch $pkgArch -FileName $_.Name -Names $Spec.names -Arches $Spec.arches
+            } |
             Sort-Object Name -Descending |
             Select-Object -First 1
 
@@ -223,11 +223,11 @@ foreach ($spec in $dependencySpecs) {
     if ($null -eq $resolved) {
         $failedName = "$($spec.repo):$($spec.names -join '|')"
         Write-Warning "Unable to resolve package for $failedName (compatible with $targetTag)"
-        $packages += @{ name = $failedName; urls = @() }
+        $packages += @{ name = $failedName; urls = @(); unresolved = $true }
         continue
     }
 
-    $packages += @{ name = $resolved.FileName; urls = $resolved.Urls }
+    $packages += @{ name = $resolved.FileName; urls = $resolved.Urls; unresolved = $false }
 }
 
 Write-Host "Downloading RPMs to: $outputDir"
@@ -239,6 +239,12 @@ if ($LocalPackageDir) {
 
 $failed = @()
 foreach ($pkg in $packages) {
+    if ($pkg.unresolved) {
+        $failed += $pkg.name
+        Write-Warning "  [MISS] $($pkg.name)"
+        continue
+    }
+
     $fileName = $pkg.name
     if ($pkg.urls.Count -gt 0) {
         $fileName = $pkg.urls[0].Split('/')[-1]
