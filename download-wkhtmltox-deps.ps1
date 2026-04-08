@@ -25,35 +25,36 @@ $wkhtmltoxUrls = @(
 )
 
 $repoMetadataCache = @{}
+$defaultRepos = @("BaseOS", "AppStream")
 
 $dependencySpecs = @(
     # Direct missing .so dependencies (from ldd output)
-    @{ repo = "AppStream"; names = @("libjpeg-turbo"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("libpng", "libpng15"); arches = @("x86_64") },
-    @{ repo = "AppStream"; names = @("libXrender"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("fontconfig"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("freetype"); arches = @("x86_64") },
-    @{ repo = "AppStream"; names = @("libXext"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("libX11"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libjpeg-turbo"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libpng", "libpng15"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libXrender"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("fontconfig"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("freetype"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libXext"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libX11"); arches = @("x86_64") },
 
     # Transitive deps (libX11 -> libxcb -> libXau)
-    @{ repo = "BaseOS"; names = @("libxcb"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("libXau"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("libXdmcp"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("libX11-common"); arches = @("noarch") },
+    @{ repos = $defaultRepos; names = @("libxcb"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libXau"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libXdmcp"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("libX11-common"); arches = @("noarch") },
 
     # Runtime font packages required by wkhtmltox RPM dependencies
-    @{ repo = "AppStream"; names = @("xorg-x11-fonts-75dpi"); arches = @("noarch") },
-    @{ repo = "AppStream"; names = @("xorg-x11-fonts-Type1"); arches = @("noarch") },
-    @{ repo = "AppStream"; names = @("xorg-x11-font-utils", "xorg-x11-utils"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("fontpackages-filesystem"); arches = @("noarch") },
+    @{ repos = $defaultRepos; names = @("xorg-x11-fonts-75dpi"); arches = @("noarch") },
+    @{ repos = $defaultRepos; names = @("xorg-x11-fonts-Type1"); arches = @("noarch") },
+    @{ repos = $defaultRepos; names = @("xorg-x11-font-utils", "xorg-x11-utils"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("fontpackages-filesystem"); arches = @("noarch") },
 
     # Missing deps frequently seen in offline installs
-    @{ repo = "AppStream"; names = @("libfontenc"); arches = @("x86_64") },
-    @{ repo = "AppStream"; names = @("ttmkfdir"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("pkgconf-pkg-config"); arches = @("x86_64") },
-    @{ repo = "BaseOS"; names = @("dejavu-fonts-common"); arches = @("noarch") },
-    @{ repo = "BaseOS"; names = @("dejavu-sans-fonts"); arches = @("noarch") }
+    @{ repos = $defaultRepos; names = @("libfontenc"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("ttmkfdir"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("pkgconf-pkg-config"); arches = @("x86_64") },
+    @{ repos = $defaultRepos; names = @("dejavu-fonts-common"); arches = @("noarch") },
+    @{ repos = $defaultRepos; names = @("dejavu-sans-fonts"); arches = @("noarch") }
 )
 
 function Test-RpmCompatibility {
@@ -69,8 +70,11 @@ function Test-RpmCompatibility {
 
     if (-not ($Arches -contains $PackageArch)) { return $false }
 
-    if ($FileName -match "\\.almalinux8\\.") { return $true }
-    if ($FileName -match "\\.el8([._-]|\\.)") { return $true }
+    # Keep only runtime libraries/tools required by wkhtmltox.
+    if ($PackageName -match "-(devel|debuginfo|debugsource|utils)$") { return $false }
+
+    if ($FileName -match '\.almalinux8\.') { return $true }
+    if ($FileName -match '\.el8([._-]|\.)') { return $true }
 
     return $false
 }
@@ -168,14 +172,16 @@ function Resolve-DependencySources {
     $candidateUrls = @()
 
     foreach ($mirror in $Mirrors) {
-        $repoPkgs = Get-MirrorRepoPackages -MirrorBase $mirror -RepoName $Spec.repo
-        $best = $repoPkgs |
-            Where-Object { Test-RpmCompatibility -PackageName $_.Name -PackageArch $_.Arch -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
-            Sort-Object BuildTime, FileName -Descending |
-            Select-Object -First 1
+        foreach ($repo in $Spec.repos) {
+            $repoPkgs = Get-MirrorRepoPackages -MirrorBase $mirror -RepoName $repo
+            $best = $repoPkgs |
+                Where-Object { Test-RpmCompatibility -PackageName $_.Name -PackageArch $_.Arch -FileName $_.FileName -Names $Spec.names -Arches $Spec.arches } |
+                Sort-Object BuildTime, FileName -Descending |
+                Select-Object -First 1
 
-        if ($best) {
-            $candidateUrls += $best.Url
+            if ($best) {
+                $candidateUrls += $best.Url
+            }
         }
     }
 
@@ -187,7 +193,7 @@ function Resolve-DependencySources {
     if (-not $fileName -and $LocalDir) {
         $localBest = Get-ChildItem -Path $LocalDir -Filter "*.rpm" -File -ErrorAction SilentlyContinue |
             Where-Object {
-                $pkgArch = if ($_.Name -match "\\.([^.]+)\\.rpm$") { $Matches[1] } else { "" }
+                $pkgArch = if ($_.Name -match '\.([^.]+)\.rpm$') { $Matches[1] } else { "" }
                 $pkgName = ""
                 foreach ($candidateName in $Spec.names) {
                     if ($_.Name -match "^$([regex]::Escape($candidateName))-") {
@@ -221,7 +227,7 @@ $packages += @{ name = "wkhtmltox"; urls = $wkhtmltoxUrls }
 foreach ($spec in $dependencySpecs) {
     $resolved = Resolve-DependencySources -Spec $spec -Mirrors $MirrorBaseUrls -LocalDir $LocalPackageDir
     if ($null -eq $resolved) {
-        $failedName = "$($spec.repo):$($spec.names -join '|')"
+        $failedName = "{0}:{1}" -f ([string]::Join('+', $spec.repos)), ([string]::Join('|', $spec.names))
         Write-Warning "Unable to resolve package for $failedName (compatible with $targetTag)"
         $packages += @{ name = $failedName; urls = @(); unresolved = $true }
         continue
@@ -272,7 +278,7 @@ foreach ($pkg in $packages) {
     if ($LocalPackageDir) {
         $localPath = Join-Path $LocalPackageDir $fileName
         if (Test-Path $localPath) {
-            Copy-Item -Path $localPath -Destination $destPath -Force
+            Copy-Item -Path $localPath -Destination $des tPath -Force
             Write-Host "         -> OK from local dir: $localPath"
             continue
         }
