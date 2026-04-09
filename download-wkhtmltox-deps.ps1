@@ -135,6 +135,10 @@ function Copy-IfMissing([string]$Src, [string]$Dst) {
   }
 }
 
+function Read-Xml([string]$Path) {
+  [xml](Get-Content -LiteralPath $Path -Raw)
+}
+
 # UBI 8 public repos (lub mirror)
 $BaseUrl = if ($RepoBaseUrl) { $RepoBaseUrl.TrimEnd('/') } else { "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi$UbiRelease/$UbiRelease/$Arch" }
 $Repos = @(
@@ -165,11 +169,14 @@ function Get-RepoMetadata([hashtable]$Repo) {
     Invoke-Download $repomdUrl $repomdFile
   }
 
-  [xml]$repomd = Get-Content -LiteralPath $repomdFile
+  $repomd = Read-Xml $repomdFile
   $ns = New-Object System.Xml.XmlNamespaceManager($repomd.NameTable)
   $ns.AddNamespace('repo', 'http://linux.duke.edu/metadata/repo')
 
   $primaryNode = $repomd.SelectSingleNode("//repo:data[@type='primary']/repo:location", $ns)
+  if (-not $primaryNode) {
+    $primaryNode = $repomd.SelectSingleNode("/*[local-name()='repomd']/*[local-name()='data' and @type='primary']/*[local-name()='location']")
+  }
   if (-not $primaryNode) { throw "Brak primary w repomd.xml dla repo $($Repo.Name)" }
   $primaryHref = $primaryNode.GetAttribute('href')
 
@@ -200,10 +207,19 @@ function Get-RepoMetadata([hashtable]$Repo) {
     } finally { $gzStream.Dispose() }
   }
 
-  [xml]$primary = Get-Content -LiteralPath $primaryXml
+  $primary = Read-Xml $primaryXml
   $ns2 = New-Object System.Xml.XmlNamespaceManager($primary.NameTable)
   $ns2.AddNamespace('common', 'http://linux.duke.edu/metadata/common')
   $ns2.AddNamespace('rpm', 'http://linux.duke.edu/metadata/rpm')
+
+  $pkgCount = @($primary.SelectNodes('//common:package', $ns2)).Count
+  if ($pkgCount -eq 0) {
+    $pkgCount = @($primary.SelectNodes("//*[local-name()='package']")).Count
+  }
+  Write-Info "Repo $($Repo.Name): znaleziono pakietow w primary.xml = $pkgCount"
+  if ($pkgCount -eq 0) {
+    throw "primary.xml dla repo $($Repo.Name) nie zawiera zadnych pakietow (problem namespace/XPath lub uszkodzone repodata)."
+  }
 
   return @{
     Repo = $Repo
@@ -213,12 +229,26 @@ function Get-RepoMetadata([hashtable]$Repo) {
 }
 
 function Get-PackageNodesByName($Meta, [string]$Name) {
-  $Meta.Primary.SelectNodes("//common:package[common:name='$Name']", $Meta.Ns)
+  $nodes = $Meta.Primary.SelectNodes("//common:package[common:name='$Name']", $Meta.Ns)
+  if (-not $nodes -or $nodes.Count -eq 0) {
+    $nodes = $Meta.Primary.SelectNodes("//*[local-name()='package'][*[local-name()='name' and text()='$Name']]")
+  }
+  $nodes
+}
+
+function Get-PackageName($PkgNode, $Ns) {
+  $nameNode = $PkgNode.SelectSingleNode('common:name', $Ns)
+  if (-not $nameNode) { $nameNode = $PkgNode.SelectSingleNode("*[local-name()='name']") }
+  if ($nameNode) { return $nameNode.InnerText }
+  return ''
 }
 
 function Get-ProvidesCapabilities($PkgNode, $Ns) {
   $caps = @()
   $provideNodes = $PkgNode.SelectNodes('common:format/rpm:provides/rpm:entry', $Ns)
+  if (-not $provideNodes -or $provideNodes.Count -eq 0) {
+    $provideNodes = $PkgNode.SelectNodes("*[local-name()='format']/*[local-name()='provides']/*[local-name()='entry']")
+  }
   foreach ($n in $provideNodes) {
     $caps += $n.GetAttribute('name')
   }
@@ -228,6 +258,9 @@ function Get-ProvidesCapabilities($PkgNode, $Ns) {
 function Get-RequireCapabilities($PkgNode, $Ns) {
   $caps = @()
   $reqNodes = $PkgNode.SelectNodes('common:format/rpm:requires/rpm:entry', $Ns)
+  if (-not $reqNodes -or $reqNodes.Count -eq 0) {
+    $reqNodes = $PkgNode.SelectNodes("*[local-name()='format']/*[local-name()='requires']/*[local-name()='entry']")
+  }
   foreach ($n in $reqNodes) {
     $name = $n.GetAttribute('name')
     if ($name -and ($name -notlike 'rpmlib(*)') -and ($name -notlike 'config(*)') -and ($name -notlike 'post(*)') -and ($name -notlike 'pre(*)')) {
@@ -239,6 +272,7 @@ function Get-RequireCapabilities($PkgNode, $Ns) {
 
 function Get-PackageDownloadInfo($PkgNode, $RepoUrl, $Ns) {
   $loc = $PkgNode.SelectSingleNode('common:location', $Ns)
+  if (-not $loc) { $loc = $PkgNode.SelectSingleNode("*[local-name()='location']") }
   if (-not $loc) { return $null }
   $href = $loc.GetAttribute('href')
   $fileName = Split-Path $href -Leaf
@@ -267,6 +301,7 @@ $NameIndex = @{}
 
 function Get-PackageArch($PkgNode, $Ns) {
   $archNode = $PkgNode.SelectSingleNode('common:arch', $Ns)
+  if (-not $archNode) { $archNode = $PkgNode.SelectSingleNode("*[local-name()='arch']") }
   if ($archNode) { return $archNode.InnerText }
   return ''
 }
@@ -281,8 +316,12 @@ function Get-ArchPriority([string]$Arch) {
 }
 foreach ($m in $Metas) {
   $pkgs = $m.Primary.SelectNodes('//common:package', $m.Ns)
+  if (-not $pkgs -or $pkgs.Count -eq 0) {
+    $pkgs = $m.Primary.SelectNodes("//*[local-name()='package']")
+  }
   foreach ($p in $pkgs) {
-    $name = $p.SelectSingleNode('common:name', $m.Ns).InnerText
+    $name = Get-PackageName $p $m.Ns
+    if (-not $name) { continue }
     if (-not $NameIndex.ContainsKey($name)) {
       $NameIndex[$name] = @()
     }
@@ -332,7 +371,7 @@ if ($WhatRequires) {
     Write-Err "Nie znaleziono providera dla capability: $WhatRequires"
     exit 2
   }
-  $n = $prov.Node.SelectSingleNode('common:name', $prov.Meta.Ns).InnerText
+  $n = Get-PackageName $prov.Node $prov.Meta.Ns
   Write-Info "Provider for '$WhatRequires' => package: $n (repo: $($prov.Meta.Repo.Name))"
 }
 
@@ -354,7 +393,11 @@ while ($Queue.Count -gt 0) {
     continue
   }
 
-  $pkgName = $resolved.Node.SelectSingleNode('common:name', $resolved.Meta.Ns).InnerText
+  $pkgName = Get-PackageName $resolved.Node $resolved.Meta.Ns
+  if (-not $pkgName) {
+    Write-Warn "Pominieto wpis bez nazwy pakietu dla capability: $item"
+    continue
+  }
   if (-not $Selected.ContainsKey($pkgName)) {
     $Selected[$pkgName] = $resolved
 
