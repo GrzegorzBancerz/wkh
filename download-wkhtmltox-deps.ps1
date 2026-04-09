@@ -271,8 +271,8 @@ function Resolve-Package([string]$NameOrCap) {
   if ($NameIndex.ContainsKey($NameOrCap)) {
     $candidates = $NameIndex[$NameOrCap]
     # prefer: repo appstream, then arch x86_64/noarch, then anything else
-    $sorted = $candidates | Sort-Object \
-      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, \
+    $sorted = $candidates | Sort-Object `
+      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
@@ -281,8 +281,8 @@ function Resolve-Package([string]$NameOrCap) {
   }
   if ($ProvideIndex.ContainsKey($NameOrCap)) {
     $candidates = $ProvideIndex[$NameOrCap]
-    $sorted = $candidates | Sort-Object \
-      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, \
+    $sorted = $candidates | Sort-Object `
+      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
