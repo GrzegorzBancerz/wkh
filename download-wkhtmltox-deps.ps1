@@ -292,9 +292,8 @@ function Get-ProvidesCapabilities($PkgNode, $Ns) {
 
 function Is-IgnorableCapability([string]$Name) {
   if (-not $Name) { return $true }
-  if ($Name.StartsWith('/')) { return $true } # file path requires (zwykle z base image)
-  if ($Name -like 'pkgconfig(*)') { return $true }
-  if ($Name -match '\.so(\.|\(|$)') { return $true }
+  # Do not skip file/.so requirements in offline mode.
+  # They are needed to produce a self-contained RPM bundle.
   return $false
 }
 
