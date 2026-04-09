@@ -77,7 +77,11 @@ param(
     'nss',
     'pango',
     'xdg-utils',
+    'xdg-utils-minimal',
     'liberation-fonts',
+    'liberation-sans-fonts',
+    'liberation-serif-fonts',
+    'vulkan-loader',
     'dejavu-sans-fonts'
   ),
 
