@@ -255,6 +255,14 @@ function Get-ProvidesCapabilities($PkgNode, $Ns) {
   return $caps
 }
 
+function Is-IgnorableCapability([string]$Name) {
+  if (-not $Name) { return $true }
+  if ($Name.StartsWith('/')) { return $true } # file path requires (zwykle z base image)
+  if ($Name -like 'pkgconfig(*)') { return $true }
+  if ($Name -match '\.so(\.|\(|$)') { return $true }
+  return $false
+}
+
 function Get-RequireCapabilities($PkgNode, $Ns) {
   $caps = @()
   $reqNodes = $PkgNode.SelectNodes('common:format/rpm:requires/rpm:entry', $Ns)
@@ -263,7 +271,12 @@ function Get-RequireCapabilities($PkgNode, $Ns) {
   }
   foreach ($n in $reqNodes) {
     $name = $n.GetAttribute('name')
-    if ($name -and ($name -notlike 'rpmlib(*)') -and ($name -notlike 'config(*)') -and ($name -notlike 'post(*)') -and ($name -notlike 'pre(*)')) {
+    if ($name -and
+        ($name -notlike 'rpmlib(*)') -and
+        ($name -notlike 'config(*)') -and
+        ($name -notlike 'post(*)') -and
+        ($name -notlike 'pre(*)') -and
+        (-not (Is-IgnorableCapability $name))) {
       $caps += $name
     }
   }
@@ -334,45 +347,60 @@ foreach ($m in $Metas) {
   }
 }
 
+$PackageAliases = @{
+  'chromium' = @('chromium', 'chromium-browser', 'chromium-headless', 'google-chrome-stable', 'google-chrome')
+  'xdg-utils' = @('xdg-utils', 'xdg-utils-minimal')
+  'liberation-fonts' = @('liberation-fonts', 'liberation-sans-fonts', 'liberation-serif-fonts', 'liberation-mono-fonts')
+}
+
 function Resolve-Package([string]$NameOrCap) {
-  if ($NameIndex.ContainsKey($NameOrCap)) {
-    $candidates = $NameIndex[$NameOrCap]
-    # defensywnie odfiltruj niepoprawne wpisy (np. puste/nieoczekiwany typ)
-    $candidates = @($candidates | Where-Object {
-      if (-not $_) { return $false }
-      if ($_ -is [System.Collections.IDictionary]) {
-        return $_.Contains('Meta') -and $_.Contains('Node')
-      }
-      return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
-    })
-    # prefer: repo appstream, then arch x86_64/noarch, then anything else
-    $sorted = @($candidates | Sort-Object `
-      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
-      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
-    if (-not $sorted -or $sorted.Count -eq 0) { return $null }
-    $best = $sorted[0]
-    $arch = Get-PackageArch $best.Node $best.Meta.Ns
-    if ($arch -eq 'i686') { return $null }
-    return $best
+  $namesToTry = @($NameOrCap)
+  if ($PackageAliases.ContainsKey($NameOrCap)) {
+    $namesToTry = @($PackageAliases[$NameOrCap])
   }
-  if ($ProvideIndex.ContainsKey($NameOrCap)) {
-    $candidates = $ProvideIndex[$NameOrCap]
-    $candidates = @($candidates | Where-Object {
-      if (-not $_) { return $false }
-      if ($_ -is [System.Collections.IDictionary]) {
-        return $_.Contains('Meta') -and $_.Contains('Node')
+
+  foreach ($name in $namesToTry) {
+    if ($NameIndex.ContainsKey($name)) {
+      $candidates = $NameIndex[$name]
+      # defensywnie odfiltruj niepoprawne wpisy (np. puste/nieoczekiwany typ)
+      $candidates = @($candidates | Where-Object {
+        if (-not $_) { return $false }
+        if ($_ -is [System.Collections.IDictionary]) {
+          return $_.Contains('Meta') -and $_.Contains('Node')
+        }
+        return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
+      })
+      # prefer: repo appstream, then arch x86_64/noarch, then anything else
+      $sorted = @($candidates | Sort-Object `
+        @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
+        @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
+      if ($sorted.Count -gt 0) {
+        $best = $sorted[0]
+        $arch = Get-PackageArch $best.Node $best.Meta.Ns
+        if ($arch -ne 'i686') { return $best }
       }
-      return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
-    })
-    $sorted = @($candidates | Sort-Object `
-      @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
-      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
-    if (-not $sorted -or $sorted.Count -eq 0) { return $null }
-    $best = $sorted[0]
-    $arch = Get-PackageArch $best.Node $best.Meta.Ns
-    if ($arch -eq 'i686') { return $null }
-    return $best
+    }
+
+    if ($ProvideIndex.ContainsKey($name)) {
+      $candidates = $ProvideIndex[$name]
+      $candidates = @($candidates | Where-Object {
+        if (-not $_) { return $false }
+        if ($_ -is [System.Collections.IDictionary]) {
+          return $_.Contains('Meta') -and $_.Contains('Node')
+        }
+        return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
+      })
+      $sorted = @($candidates | Sort-Object `
+        @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
+        @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
+      if ($sorted.Count -gt 0) {
+        $best = $sorted[0]
+        $arch = Get-PackageArch $best.Node $best.Meta.Ns
+        if ($arch -ne 'i686') { return $best }
+      }
+    }
   }
+
   return $null
 }
 
