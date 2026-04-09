@@ -89,6 +89,11 @@ param(
 
   # Opcjonalnie: proxy dla Invoke-WebRequest, np. http://proxy:8080
   [string]$Proxy
+
+  ,
+  # Opcjonalnie: praca offline na już pobranym repodata (repomd.xml + primary.xml.gz)
+  # Struktura jak na mirrorze: <OfflineRepoPath>/(baseos|appstream)/os/repodata/...
+  [string]$OfflineRepoPath
 )
 
 Set-StrictMode -Version Latest
@@ -124,6 +129,12 @@ function Invoke-Download([string]$Url, [string]$OutFile) {
   Invoke-WebRequest @iwr
 }
 
+function Copy-IfMissing([string]$Src, [string]$Dst) {
+  if (-not (Test-Path -LiteralPath $Dst)) {
+    Copy-Item -LiteralPath $Src -Destination $Dst
+  }
+}
+
 # UBI 8 public repos (lub mirror)
 $BaseUrl = if ($RepoBaseUrl) { $RepoBaseUrl.TrimEnd('/') } else { "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi$UbiRelease/$UbiRelease/$Arch" }
 $Repos = @(
@@ -141,9 +152,18 @@ function Get-RepoMetadata([hashtable]$Repo) {
   $repodataDir = Join-Path $Cache ("repodata-" + $Repo.Name)
   Ensure-Dir $repodataDir
 
-  $repomdUrl = "$($Repo.Url)/repodata/repomd.xml"
   $repomdFile = Join-Path $repodataDir "repomd.xml"
-  Invoke-Download $repomdUrl $repomdFile
+
+  if ($OfflineRepoPath) {
+    $offlineRepomd = Join-Path $OfflineRepoPath ("{0}\\os\\repodata\\repomd.xml" -f $Repo.Name)
+    if (-not (Test-Path -LiteralPath $offlineRepomd)) {
+      throw "OfflineRepoPath wskazuje na brakujacy plik: $offlineRepomd"
+    }
+    Copy-IfMissing $offlineRepomd $repomdFile
+  } else {
+    $repomdUrl = "$($Repo.Url)/repodata/repomd.xml"
+    Invoke-Download $repomdUrl $repomdFile
+  }
 
   [xml]$repomd = Get-Content -LiteralPath $repomdFile
   $ns = New-Object System.Xml.XmlNamespaceManager($repomd.NameTable)
@@ -153,9 +173,17 @@ function Get-RepoMetadata([hashtable]$Repo) {
   if (-not $primaryNode) { throw "Brak primary w repomd.xml dla repo $($Repo.Name)" }
   $primaryHref = $primaryNode.GetAttribute('href')
 
-  $primaryUrl = "$($Repo.Url)/$primaryHref"
   $primaryGz = Join-Path $repodataDir (Split-Path $primaryHref -Leaf)
-  Invoke-Download $primaryUrl $primaryGz
+  if ($OfflineRepoPath) {
+    $offlinePrimary = Join-Path $OfflineRepoPath ("{0}\\os\\{1}" -f $Repo.Name, ($primaryHref -replace '/', '\\'))
+    if (-not (Test-Path -LiteralPath $offlinePrimary)) {
+      throw "OfflineRepoPath wskazuje na brakujacy plik: $offlinePrimary"
+    }
+    Copy-IfMissing $offlinePrimary $primaryGz
+  } else {
+    $primaryUrl = "$($Repo.Url)/$primaryHref"
+    Invoke-Download $primaryUrl $primaryGz
+  }
 
   $primaryXml = Join-Path $repodataDir "primary.xml"
   if (-not (Test-Path -LiteralPath $primaryXml)) {
@@ -274,6 +302,7 @@ function Resolve-Package([string]$NameOrCap) {
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+    if (-not $sorted -or $sorted.Count -eq 0) { return $null }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
     if ($arch -eq 'i686') { return $null }
@@ -284,6 +313,7 @@ function Resolve-Package([string]$NameOrCap) {
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+    if (-not $sorted -or $sorted.Count -eq 0) { return $null }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
     if ($arch -eq 'i686') { return $null }
@@ -335,6 +365,11 @@ while ($Queue.Count -gt 0) {
 }
 
 Write-Info "Do pobrania pakietow: $($Selected.Keys.Count)"
+
+if ($Selected.Keys.Count -eq 0) {
+  Write-Err "Nie wybrano zadnych pakietow do pobrania. Sprawdz: (1) czy repo zawiera chromium dla UBI8; (2) czy Arch jest poprawny; (3) czy OfflineRepoPath/RepoBaseUrl wskazuje na poprawny mirror."
+  exit 3
+}
 
 # Download RPM files
 foreach ($kv in $Selected.GetEnumerator()) {
