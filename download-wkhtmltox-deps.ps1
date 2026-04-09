@@ -97,7 +97,18 @@ param(
 
   # Opcjonalnie: lokalny RPM Chromium/Chrome (plik lub katalog z *.rpm),
   # kopiowany do Destination jako fallback gdy UBI8 nie zawiera pakietu chromium.
-  [string]$BrowserRpmPath
+  [string]$BrowserRpmPath,
+
+  # Opcjonalnie: bezposredni URL do RPM przegladarki (np. google-chrome-stable_current_x86_64.rpm)
+  # uzywany gdy chromium/chrome nie zostanie znalezione w repodata.
+  [string]$BrowserRpmUrl = 'https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm',
+
+  # Dodatkowe repozytoria (pelny URL do katalogu z repodata, np. .../x86_64/os)
+  [string[]]$AdditionalRepoUrls = @(),
+
+  # Dodaj domyslne repo community (CentOS Stream 8), aby domknac zaleznosci,
+  # ktorych zwykle nie ma w UBI.
+  [bool]$UseCommunityRepos = $true
 )
 
 Set-StrictMode -Version Latest
@@ -170,16 +181,50 @@ function Add-LocalBrowserRpms([string]$Path, [string]$OutDir) {
   return $copied
 }
 
+function Add-BrowserRpmFromUrl([string]$Url, [string]$OutDir) {
+  if (-not $Url) { return 0 }
+  try {
+    $uri = [System.Uri]$Url
+    $fileName = Split-Path $uri.AbsolutePath -Leaf
+    if (-not $fileName) { $fileName = 'browser.rpm' }
+    $out = Join-Path $OutDir $fileName
+    Invoke-Download $Url $out
+    if (Test-Path -LiteralPath $out) {
+      Write-Info "Dodano RPM przegladarki z URL: $fileName"
+      return 1
+    }
+  } catch {
+    Write-Warn "Nie udalo sie pobrac BrowserRpmUrl ($Url): $($_.Exception.Message)"
+  }
+  return 0
+}
+
 function Read-Xml([string]$Path) {
   [xml](Get-Content -LiteralPath $Path -Raw)
 }
 
-# UBI 8 public repos (lub mirror)
+# UBI 8 public repos (lub mirror) + opcjonalne community repos
 $BaseUrl = if ($RepoBaseUrl) { $RepoBaseUrl.TrimEnd('/') } else { "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi$UbiRelease/$UbiRelease/$Arch" }
 $Repos = @(
-  @{ Name = 'baseos';    RepoId='ubi-8-baseos-rpms';    Url = "$BaseUrl/baseos/os" },
-  @{ Name = 'appstream'; RepoId='ubi-8-appstream-rpms'; Url = "$BaseUrl/appstream/os" }
+  @{ Name = 'ubi-baseos';    RepoId='ubi-8-baseos-rpms';    Url = "$BaseUrl/baseos/os" },
+  @{ Name = 'ubi-appstream'; RepoId='ubi-8-appstream-rpms'; Url = "$BaseUrl/appstream/os" }
 )
+
+if ($UseCommunityRepos) {
+  $Repos += @(
+    @{ Name = 'cs8-baseos'; RepoId='cs8-baseos'; Url = "https://mirror.stream.centos.org/8-stream/BaseOS/$Arch/os" },
+    @{ Name = 'cs8-appstream'; RepoId='cs8-appstream'; Url = "https://mirror.stream.centos.org/8-stream/AppStream/$Arch/os" },
+    @{ Name = 'cs8-powertools'; RepoId='cs8-powertools'; Url = "https://mirror.stream.centos.org/8-stream/PowerTools/$Arch/os" }
+  )
+}
+
+foreach ($repoUrl in $AdditionalRepoUrls) {
+  if ($repoUrl) {
+    $trimmed = $repoUrl.TrimEnd('/')
+    $name = "custom-" + ([Math]::Abs($trimmed.GetHashCode()))
+    $Repos += @(@{ Name = $name; RepoId = $name; Url = $trimmed })
+  }
+}
 
 Ensure-Dir $Destination
 $Cache = Join-Path $Destination ".cache"
@@ -361,6 +406,17 @@ function Get-ArchPriority([string]$Arch) {
     default  { return 5 }
   }
 }
+
+function Get-RepoPriority([string]$RepoName) {
+  switch ($RepoName) {
+    'ubi-appstream' { return 0 }
+    'ubi-baseos' { return 1 }
+    'cs8-appstream' { return 2 }
+    'cs8-baseos' { return 3 }
+    'cs8-powertools' { return 4 }
+    default { return 9 }
+  }
+}
 foreach ($m in $Metas) {
   $pkgs = $m.Primary.SelectNodes('//common:package', $m.Ns)
   if (-not $pkgs -or $pkgs.Count -eq 0) {
@@ -384,7 +440,7 @@ foreach ($m in $Metas) {
 $PackageAliases = @{
   'chromium' = @('chromium', 'chromium-browser', 'chromium-headless', 'google-chrome-stable', 'google-chrome')
   'xdg-utils' = @('xdg-utils', 'xdg-utils-minimal')
-  'liberation-fonts' = @('liberation-fonts', 'liberation-sans-fonts', 'liberation-serif-fonts', 'liberation-mono-fonts')
+  'liberation-fonts' = @('liberation-fonts', 'liberation-sans-fonts', 'liberation-serif-fonts', 'liberation-mono-fonts', 'liberation-fonts-common')
 }
 
 $SoftMissingRoots = @{
@@ -411,7 +467,7 @@ function Resolve-Package([string]$NameOrCap) {
       })
       # prefer: repo appstream, then arch x86_64/noarch, then anything else
       $sorted = @($candidates | Sort-Object `
-        @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
+        @{ Expression = { Get-RepoPriority $_.Meta.Repo.Name }; Ascending = $true }, `
         @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
       if ($sorted.Count -gt 0) {
         $best = $sorted[0]
@@ -430,7 +486,7 @@ function Resolve-Package([string]$NameOrCap) {
         return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
       })
       $sorted = @($candidates | Sort-Object `
-        @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
+        @{ Expression = { Get-RepoPriority $_.Meta.Repo.Name }; Ascending = $true }, `
         @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
       if ($sorted.Count -gt 0) {
         $best = $sorted[0]
@@ -459,6 +515,7 @@ $Queue = New-Object System.Collections.Generic.Queue[string]
 $Visited = New-Object 'System.Collections.Generic.HashSet[string]'
 $Selected = @{} # pkgName -> {Meta,Node}
 $RootRequested = New-Object 'System.Collections.Generic.HashSet[string]'
+$SkippedFileCaps = 0
 
 foreach ($p in $Packages) {
   $Queue.Enqueue($p)
@@ -472,6 +529,10 @@ while ($Queue.Count -gt 0) {
 
   $resolved = Resolve-Package $item
   if (-not $resolved) {
+    if ((-not $RootRequested.Contains($item)) -and $item.StartsWith('/')) {
+      $SkippedFileCaps++
+      continue
+    }
     if ($RootRequested.Contains($item) -and $SoftMissingRoots.ContainsKey($item)) {
       Write-Warn "Nie znaleziono pakietu/capability: $item (pomijam). $($SoftMissingRoots[$item])"
     } else {
@@ -500,6 +561,15 @@ while ($Queue.Count -gt 0) {
 Write-Info "Do pobrania pakietow: $($Selected.Keys.Count)"
 
 $localBrowserRpms = Add-LocalBrowserRpms $BrowserRpmPath $Destination
+
+$hasBrowser = @($Selected.Keys | Where-Object { $_ -match '^(chromium|google-chrome)' }).Count -gt 0
+if ((-not $hasBrowser) -and $RootRequested.Contains('chromium')) {
+  $localBrowserRpms += Add-BrowserRpmFromUrl $BrowserRpmUrl $Destination
+}
+
+if ($SkippedFileCaps -gt 0) {
+  Write-Info "Pominiete brakujace capability plikowe (pokrywane zwykle przez base image): $SkippedFileCaps"
+}
 
 if ($Selected.Keys.Count -eq 0 -and $localBrowserRpms -eq 0) {
   Write-Err "Nie wybrano zadnych pakietow do pobrania. Sprawdz: (1) czy repo zawiera chromium dla UBI8; (2) czy Arch jest poprawny; (3) czy OfflineRepoPath/RepoBaseUrl wskazuje na poprawny mirror."
