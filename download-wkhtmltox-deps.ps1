@@ -298,6 +298,8 @@ foreach ($m in $Metas) {
 function Resolve-Package([string]$NameOrCap) {
   if ($NameIndex.ContainsKey($NameOrCap)) {
     $candidates = $NameIndex[$NameOrCap]
+    # defensywnie odfiltruj niepoprawne wpisy (np. puste/nieoczekiwany typ)
+    $candidates = @($candidates | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Meta' -and $_.PSObject.Properties.Name -contains 'Node' })
     # prefer: repo appstream, then arch x86_64/noarch, then anything else
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
@@ -310,6 +312,7 @@ function Resolve-Package([string]$NameOrCap) {
   }
   if ($ProvideIndex.ContainsKey($NameOrCap)) {
     $candidates = $ProvideIndex[$NameOrCap]
+    $candidates = @($candidates | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Meta' -and $_.PSObject.Properties.Name -contains 'Node' })
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
