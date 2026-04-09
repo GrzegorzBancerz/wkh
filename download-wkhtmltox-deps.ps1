@@ -93,7 +93,11 @@ param(
   ,
   # Opcjonalnie: praca offline na już pobranym repodata (repomd.xml + primary.xml.gz)
   # Struktura jak na mirrorze: <OfflineRepoPath>/(baseos|appstream)/os/repodata/...
-  [string]$OfflineRepoPath
+  [string]$OfflineRepoPath,
+
+  # Opcjonalnie: lokalny RPM Chromium/Chrome (plik lub katalog z *.rpm),
+  # kopiowany do Destination jako fallback gdy UBI8 nie zawiera pakietu chromium.
+  [string]$BrowserRpmPath
 )
 
 Set-StrictMode -Version Latest
@@ -133,6 +137,37 @@ function Copy-IfMissing([string]$Src, [string]$Dst) {
   if (-not (Test-Path -LiteralPath $Dst)) {
     Copy-Item -LiteralPath $Src -Destination $Dst
   }
+}
+
+function Add-LocalBrowserRpms([string]$Path, [string]$OutDir) {
+  if (-not $Path) { return 0 }
+  if (-not (Test-Path -LiteralPath $Path)) {
+    Write-Warn "BrowserRpmPath nie istnieje: $Path"
+    return 0
+  }
+
+  $copied = 0
+  $items = @()
+  if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    $items = @(Get-Item -LiteralPath $Path)
+  } else {
+    $items = @(Get-ChildItem -LiteralPath $Path -File -Filter *.rpm | Where-Object {
+      $_.Name -match 'chrom|chrome'
+    })
+  }
+
+  foreach ($rpm in $items) {
+    $dst = Join-Path $OutDir $rpm.Name
+    if (-not (Test-Path -LiteralPath $dst)) {
+      Copy-Item -LiteralPath $rpm.FullName -Destination $dst
+      $copied++
+    }
+  }
+
+  if ($copied -gt 0) {
+    Write-Info "Dodano lokalne RPM przegladarki: $copied"
+  }
+  return $copied
 }
 
 function Read-Xml([string]$Path) {
@@ -353,6 +388,11 @@ $PackageAliases = @{
   'liberation-fonts' = @('liberation-fonts', 'liberation-sans-fonts', 'liberation-serif-fonts', 'liberation-mono-fonts')
 }
 
+$SoftMissingRoots = @{
+  'chromium' = 'UBI8 BaseOS/AppStream zwykle nie zawiera chromium. Uzyj -BrowserRpmPath z lokalnym RPM Chrome/Chromium.'
+  'xdg-utils' = 'UBI8 moze nie miec xdg-utils; czesto wystarcza xdg-utils-minimal lub brak tego pakietu dla headless.'
+}
+
 function Resolve-Package([string]$NameOrCap) {
   $namesToTry = @($NameOrCap)
   if ($PackageAliases.ContainsKey($NameOrCap)) {
@@ -419,8 +459,12 @@ if ($WhatRequires) {
 $Queue = New-Object System.Collections.Generic.Queue[string]
 $Visited = New-Object 'System.Collections.Generic.HashSet[string]'
 $Selected = @{} # pkgName -> {Meta,Node}
+$RootRequested = New-Object 'System.Collections.Generic.HashSet[string]'
 
-foreach ($p in $Packages) { $Queue.Enqueue($p) }
+foreach ($p in $Packages) {
+  $Queue.Enqueue($p)
+  $null = $RootRequested.Add($p)
+}
 
 while ($Queue.Count -gt 0) {
   $item = $Queue.Dequeue()
@@ -429,7 +473,11 @@ while ($Queue.Count -gt 0) {
 
   $resolved = Resolve-Package $item
   if (-not $resolved) {
-    Write-Warn "Nie znaleziono pakietu/capability: $item (pomijam)"
+    if ($RootRequested.Contains($item) -and $SoftMissingRoots.ContainsKey($item)) {
+      Write-Warn "Nie znaleziono pakietu/capability: $item (pomijam). $($SoftMissingRoots[$item])"
+    } else {
+      Write-Warn "Nie znaleziono pakietu/capability: $item (pomijam)"
+    }
     continue
   }
 
@@ -452,7 +500,9 @@ while ($Queue.Count -gt 0) {
 
 Write-Info "Do pobrania pakietow: $($Selected.Keys.Count)"
 
-if ($Selected.Keys.Count -eq 0) {
+$localBrowserRpms = Add-LocalBrowserRpms $BrowserRpmPath $Destination
+
+if ($Selected.Keys.Count -eq 0 -and $localBrowserRpms -eq 0) {
   Write-Err "Nie wybrano zadnych pakietow do pobrania. Sprawdz: (1) czy repo zawiera chromium dla UBI8; (2) czy Arch jest poprawny; (3) czy OfflineRepoPath/RepoBaseUrl wskazuje na poprawny mirror."
   exit 3
 }
