@@ -206,15 +206,15 @@ function Read-Xml([string]$Path) {
 # UBI 8 public repos (lub mirror) + opcjonalne community repos
 $BaseUrl = if ($RepoBaseUrl) { $RepoBaseUrl.TrimEnd('/') } else { "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi$UbiRelease/$UbiRelease/$Arch" }
 $Repos = @(
-  @{ Name = 'ubi-baseos';    RepoId='ubi-8-baseos-rpms';    Url = "$BaseUrl/baseos/os" },
-  @{ Name = 'ubi-appstream'; RepoId='ubi-8-appstream-rpms'; Url = "$BaseUrl/appstream/os" }
+  @{ Name = 'ubi-baseos';    RepoId='ubi-8-baseos-rpms';    Url = "$BaseUrl/baseos/os"; Required = $true },
+  @{ Name = 'ubi-appstream'; RepoId='ubi-8-appstream-rpms'; Url = "$BaseUrl/appstream/os"; Required = $true }
 )
 
 if ($UseCommunityRepos) {
   $Repos += @(
-    @{ Name = 'cs8-baseos'; RepoId='cs8-baseos'; Url = "https://mirror.stream.centos.org/8-stream/BaseOS/$Arch/os" },
-    @{ Name = 'cs8-appstream'; RepoId='cs8-appstream'; Url = "https://mirror.stream.centos.org/8-stream/AppStream/$Arch/os" },
-    @{ Name = 'cs8-powertools'; RepoId='cs8-powertools'; Url = "https://mirror.stream.centos.org/8-stream/PowerTools/$Arch/os" }
+    @{ Name = 'cs8-baseos'; RepoId='cs8-baseos'; Url = "https://mirror.stream.centos.org/8-stream/BaseOS/$Arch/os"; Required = $false },
+    @{ Name = 'cs8-appstream'; RepoId='cs8-appstream'; Url = "https://mirror.stream.centos.org/8-stream/AppStream/$Arch/os"; Required = $false },
+    @{ Name = 'cs8-powertools'; RepoId='cs8-powertools'; Url = "https://mirror.stream.centos.org/8-stream/PowerTools/$Arch/os"; Required = $false }
   )
 }
 
@@ -222,7 +222,7 @@ foreach ($repoUrl in $AdditionalRepoUrls) {
   if ($repoUrl) {
     $trimmed = $repoUrl.TrimEnd('/')
     $name = "custom-" + ([Math]::Abs($trimmed.GetHashCode()))
-    $Repos += @(@{ Name = $name; RepoId = $name; Url = $trimmed })
+    $Repos += @(@{ Name = $name; RepoId = $name; Url = $trimmed; Required = $false })
   }
 }
 
@@ -382,9 +382,21 @@ foreach ($r in $Repos) {
     Write-Info "Loading repodata: $($r.Name)"
     $Metas += (Get-RepoMetadata $r)
   } catch {
-    Write-Err "Nie udalo sie pobrac repodata dla $($r.Name): $($_.Exception.Message)"
-    throw
+    $isRequired = $true
+    if ($r.ContainsKey('Required')) {
+      $isRequired = [bool]$r.Required
+    }
+    if ($isRequired) {
+      Write-Err "Nie udalo sie pobrac repodata dla $($r.Name): $($_.Exception.Message)"
+      throw
+    }
+    Write-Warn "Repo opcjonalne niedostepne ($($r.Name), $($r.Url)): $($_.Exception.Message). Pomijam."
   }
+}
+
+if ($Metas.Count -eq 0) {
+  Write-Err "Nie udalo sie zaladowac zadnego repodata. Sprawdz URL repo, proxy lub certyfikaty TLS."
+  exit 4
 }
 
 # Index: capability -> package node (first win)
