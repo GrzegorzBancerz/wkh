@@ -325,11 +325,11 @@ foreach ($m in $Metas) {
     if (-not $NameIndex.ContainsKey($name)) {
       $NameIndex[$name] = @()
     }
-    $NameIndex[$name] += @(@{ Meta=$m; Node=$p })
+    $NameIndex[$name] += @([pscustomobject]@{ Meta = $m; Node = $p })
 
     foreach ($cap in (Get-ProvidesCapabilities $p $m.Ns)) {
       if (-not $ProvideIndex.ContainsKey($cap)) { $ProvideIndex[$cap] = @() }
-      $ProvideIndex[$cap] += @(@{ Meta=$m; Node=$p })
+      $ProvideIndex[$cap] += @([pscustomobject]@{ Meta = $m; Node = $p })
     }
   }
 }
@@ -338,7 +338,13 @@ function Resolve-Package([string]$NameOrCap) {
   if ($NameIndex.ContainsKey($NameOrCap)) {
     $candidates = $NameIndex[$NameOrCap]
     # defensywnie odfiltruj niepoprawne wpisy (np. puste/nieoczekiwany typ)
-    $candidates = @($candidates | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Meta' -and $_.PSObject.Properties.Name -contains 'Node' })
+    $candidates = @($candidates | Where-Object {
+      if (-not $_) { return $false }
+      if ($_ -is [System.Collections.IDictionary]) {
+        return $_.Contains('Meta') -and $_.Contains('Node')
+      }
+      return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
+    })
     # prefer: repo appstream, then arch x86_64/noarch, then anything else
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
@@ -351,7 +357,13 @@ function Resolve-Package([string]$NameOrCap) {
   }
   if ($ProvideIndex.ContainsKey($NameOrCap)) {
     $candidates = $ProvideIndex[$NameOrCap]
-    $candidates = @($candidates | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Meta' -and $_.PSObject.Properties.Name -contains 'Node' })
+    $candidates = @($candidates | Where-Object {
+      if (-not $_) { return $false }
+      if ($_ -is [System.Collections.IDictionary]) {
+        return $_.Contains('Meta') -and $_.Contains('Node')
+      }
+      return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
+    })
     $sorted = $candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
       @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
