@@ -346,9 +346,9 @@ function Resolve-Package([string]$NameOrCap) {
       return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
     })
     # prefer: repo appstream, then arch x86_64/noarch, then anything else
-    $sorted = $candidates | Sort-Object `
+    $sorted = @($candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
-      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
     if (-not $sorted -or $sorted.Count -eq 0) { return $null }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
@@ -364,9 +364,9 @@ function Resolve-Package([string]$NameOrCap) {
       }
       return ($_.PSObject.Properties.Match('Meta').Count -gt 0) -and ($_.PSObject.Properties.Match('Node').Count -gt 0)
     })
-    $sorted = $candidates | Sort-Object `
+    $sorted = @($candidates | Sort-Object `
       @{ Expression = { $_.Meta.Repo.Name -ne 'appstream' }; Ascending = $true }, `
-      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true }
+      @{ Expression = { Get-ArchPriority (Get-PackageArch $_.Node $_.Meta.Ns) }; Ascending = $true })
     if (-not $sorted -or $sorted.Count -eq 0) { return $null }
     $best = $sorted[0]
     $arch = Get-PackageArch $best.Node $best.Meta.Ns
